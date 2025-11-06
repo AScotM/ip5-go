@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"math"
 	"net"
 	"os"
 	"os/signal"
@@ -13,11 +15,11 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
 
-// Constants
 const (
 	ProcNetDev    = "/proc/net/dev"
 	SysfsNetPath  = "/sys/class/net"
@@ -27,7 +29,6 @@ const (
 	HistorySize   = 60
 )
 
-// Configuration
 type MonitorConfig struct {
 	Interval      float64
 	CacheTTL      float64
@@ -40,7 +41,6 @@ type MonitorConfig struct {
 	ShowProcesses bool
 }
 
-// Interface Traffic Data
 type InterfaceTraffic struct {
 	Name       string
 	RxBytes    int64
@@ -75,8 +75,14 @@ func (it *InterfaceTraffic) TotalPackets() int64 {
 	return it.RxPackets + it.TxPackets
 }
 
-// Network Monitor
+type RateSample struct {
+	RxRate float64
+	TxRate float64
+	Time   time.Time
+}
+
 type NetworkMonitor struct {
+	mu             sync.RWMutex
 	config         MonitorConfig
 	ipv6Cache      map[string][]string
 	ipv6CacheTime  time.Time
@@ -90,13 +96,6 @@ type NetworkMonitor struct {
 	rateHistory    map[string][]RateSample
 }
 
-type RateSample struct {
-	RxRate float64
-	TxRate float64
-	Time   time.Time
-}
-
-// Colors for terminal output
 var Colors = struct {
 	Reset   string
 	Grey    string
@@ -142,6 +141,22 @@ func NewNetworkMonitor(config MonitorConfig) *NetworkMonitor {
 		prevTraffic: make(map[string]InterfaceTraffic),
 		rateHistory: make(map[string][]RateSample),
 	}
+}
+
+func validateConfig(config *MonitorConfig) error {
+	if config.Interval < MinInterval || config.Interval > MaxInterval {
+		return fmt.Errorf("interval must be between %d and %d", MinInterval, MaxInterval)
+	}
+	if config.MaxInterfaces <= 0 || config.MaxInterfaces > 10000 {
+		return fmt.Errorf("max interfaces must be between 1 and 10000")
+	}
+	if config.Units != "binary" && config.Units != "decimal" {
+		return fmt.Errorf("units must be 'binary' or 'decimal'")
+	}
+	if config.CacheTTL <= 0 {
+		return fmt.Errorf("cache TTL must be positive")
+	}
+	return nil
 }
 
 func (nm *NetworkMonitor) getDivisor() int64 {
@@ -207,70 +222,113 @@ func (nm *NetworkMonitor) safeInterfaceName(name string) bool {
 	return matched
 }
 
-func (nm *NetworkMonitor) getInterfaceState(interfaceName string) string {
-	if state, exists := nm.stateCache[interfaceName]; exists {
-		return state
+func (nm *NetworkMonitor) safeReadSysfsFile(interfaceName, filename string) ([]byte, error) {
+	if !nm.safeInterfaceName(interfaceName) || !nm.safeInterfaceName(filename) {
+		return nil, fmt.Errorf("invalid interface or filename")
 	}
 	
-	statePath := filepath.Join(SysfsNetPath, interfaceName, "operstate")
-	data, err := ioutil.ReadFile(statePath)
+	safePath := filepath.Clean(filepath.Join(SysfsNetPath, interfaceName, filename))
+	if !strings.HasPrefix(safePath, SysfsNetPath) {
+		return nil, fmt.Errorf("path traversal attempt detected")
+	}
+	
+	return os.ReadFile(safePath)
+}
+
+func (nm *NetworkMonitor) readInterfaceState(interfaceName string) string {
+	data, err := nm.safeReadSysfsFile(interfaceName, "operstate")
 	if err != nil {
-		nm.stateCache[interfaceName] = "unknown"
 		return "unknown"
 	}
 	
-	state := strings.TrimSpace(string(data))
+	return strings.TrimSpace(string(data))
+}
+
+func (nm *NetworkMonitor) getInterfaceState(interfaceName string) string {
+	nm.mu.RLock()
+	if state, exists := nm.stateCache[interfaceName]; exists {
+		nm.mu.RUnlock()
+		return state
+	}
+	nm.mu.RUnlock()
+	
+	state := nm.readInterfaceState(interfaceName)
+	
+	nm.mu.Lock()
 	nm.stateCache[interfaceName] = state
+	nm.mu.Unlock()
+	
 	return state
 }
 
 func (nm *NetworkMonitor) getInterfaceSpeed(interfaceName string) *int {
+	nm.mu.RLock()
 	if speed, exists := nm.speedCache[interfaceName]; exists {
+		nm.mu.RUnlock()
 		return speed
 	}
+	nm.mu.RUnlock()
 	
-	speedPath := filepath.Join(SysfsNetPath, interfaceName, "speed")
-	data, err := ioutil.ReadFile(speedPath)
+	data, err := nm.safeReadSysfsFile(interfaceName, "speed")
 	if err != nil {
+		nm.mu.Lock()
 		nm.speedCache[interfaceName] = nil
+		nm.mu.Unlock()
 		return nil
 	}
 	
 	speedStr := strings.TrimSpace(string(data))
 	speed, err := strconv.Atoi(speedStr)
 	if err != nil {
+		nm.mu.Lock()
 		nm.speedCache[interfaceName] = nil
+		nm.mu.Unlock()
 		return nil
 	}
 	
+	nm.mu.Lock()
 	nm.speedCache[interfaceName] = &speed
+	nm.mu.Unlock()
+	
 	return &speed
 }
 
 func (nm *NetworkMonitor) getInterfaceDuplex(interfaceName string) *string {
+	nm.mu.RLock()
 	if duplex, exists := nm.duplexCache[interfaceName]; exists {
+		nm.mu.RUnlock()
 		return duplex
 	}
+	nm.mu.RUnlock()
 	
-	duplexPath := filepath.Join(SysfsNetPath, interfaceName, "duplex")
-	data, err := ioutil.ReadFile(duplexPath)
+	data, err := nm.safeReadSysfsFile(interfaceName, "duplex")
 	if err != nil {
+		nm.mu.Lock()
 		nm.duplexCache[interfaceName] = nil
+		nm.mu.Unlock()
 		return nil
 	}
 	
 	duplex := strings.TrimSpace(string(data))
+	
+	nm.mu.Lock()
 	nm.duplexCache[interfaceName] = &duplex
+	nm.mu.Unlock()
+	
 	return &duplex
 }
 
 func (nm *NetworkMonitor) getAvailableInterfaces() []string {
+	nm.mu.RLock()
 	now := time.Now()
 	if nm.interfaceCache != nil && now.Sub(nm.cacheTime).Seconds() < nm.config.CacheTTL {
-		return nm.interfaceCache
+		cache := nm.interfaceCache
+		nm.mu.RUnlock()
+		return cache
 	}
+	nm.mu.RUnlock()
 	
-	files, err := ioutil.ReadDir(SysfsNetPath)
+	files, err := os.ReadDir(SysfsNetPath)
 	if err != nil {
 		return []string{}
 	}
@@ -287,7 +345,6 @@ func (nm *NetworkMonitor) getAvailableInterfaces() []string {
 			continue
 		}
 		
-		// Check if interface is actually available
 		operstate := nm.getInterfaceState(iface)
 		if operstate == "down" && !nm.config.ShowInactive {
 			continue
@@ -297,8 +354,12 @@ func (nm *NetworkMonitor) getAvailableInterfaces() []string {
 	}
 	
 	sort.Strings(interfaces)
+	
+	nm.mu.Lock()
 	nm.interfaceCache = interfaces
 	nm.cacheTime = now
+	nm.mu.Unlock()
+	
 	return interfaces
 }
 
@@ -333,25 +394,34 @@ func (nm *NetworkMonitor) validateInterfaces(requestedIfaces []string) []string 
 }
 
 func (nm *NetworkMonitor) getMTUCached(interfaceName string) *int {
+	nm.mu.RLock()
 	if mtu, exists := nm.mtuCache[interfaceName]; exists {
+		nm.mu.RUnlock()
 		return mtu
 	}
+	nm.mu.RUnlock()
 	
-	mtuPath := filepath.Join(SysfsNetPath, interfaceName, "mtu")
-	data, err := ioutil.ReadFile(mtuPath)
+	data, err := nm.safeReadSysfsFile(interfaceName, "mtu")
 	if err != nil {
+		nm.mu.Lock()
 		nm.mtuCache[interfaceName] = nil
+		nm.mu.Unlock()
 		return nil
 	}
 	
 	mtuStr := strings.TrimSpace(string(data))
 	mtu, err := strconv.Atoi(mtuStr)
 	if err != nil {
+		nm.mu.Lock()
 		nm.mtuCache[interfaceName] = nil
+		nm.mu.Unlock()
 		return nil
 	}
 	
+	nm.mu.Lock()
 	nm.mtuCache[interfaceName] = &mtu
+	nm.mu.Unlock()
+	
 	return &mtu
 }
 
@@ -386,14 +456,17 @@ func (nm *NetworkMonitor) getIPv4Info(interfaceName string) *string {
 }
 
 func (nm *NetworkMonitor) getAllIPv6InfoCached() map[string][]string {
+	nm.mu.RLock()
 	now := time.Now()
 	if nm.ipv6Cache != nil && now.Sub(nm.ipv6CacheTime).Seconds() < nm.config.CacheTTL {
-		return nm.ipv6Cache
+		cache := nm.ipv6Cache
+		nm.mu.RUnlock()
+		return cache
 	}
+	nm.mu.RUnlock()
 	
 	ipv6Map := make(map[string][]string)
 	
-	// Use net.Interfaces for IPv6 addresses
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return ipv6Map
@@ -420,8 +493,11 @@ func (nm *NetworkMonitor) getAllIPv6InfoCached() map[string][]string {
 		}
 	}
 	
+	nm.mu.Lock()
 	nm.ipv6Cache = ipv6Map
 	nm.ipv6CacheTime = now
+	nm.mu.Unlock()
+	
 	return ipv6Map
 }
 
@@ -452,7 +528,6 @@ func (nm *NetworkMonitor) formatAddrsString(addrs map[string][]string) string {
 	}
 	
 	if len(addrs["ipv6"]) > 0 {
-		// Show first 2 IPv6 addresses to avoid cluttering
 		ipv6Display := addrs["ipv6"]
 		if len(ipv6Display) > 2 {
 			ipv6Display = append(ipv6Display[:2], fmt.Sprintf("... (+%d more)", len(addrs["ipv6"])-2))
@@ -467,16 +542,26 @@ func (nm *NetworkMonitor) formatAddrsString(addrs map[string][]string) string {
 }
 
 func (nm *NetworkMonitor) calculateRate(current, previous int64, interval float64) float64 {
+	if interval <= 0 {
+		return 0.0
+	}
+	
 	if current >= previous {
 		return float64(current-previous) / interval
 	}
 	
-	// Fixed: Use proper bit shifting with integer
-	maxCount := float64(int64(1)<<uint(nm.config.CounterBits) - 1)
+	maxCount := float64(uint64(1)<<uint(nm.config.CounterBits) - 1)
+	if maxCount < 0 {
+		maxCount = math.MaxInt64
+	}
+	
 	return (maxCount - float64(previous) + float64(current) + 1) / interval
 }
 
 func (nm *NetworkMonitor) updateRateHistory(interfaceName string, rxRate, txRate float64) {
+	nm.mu.Lock()
+	defer nm.mu.Unlock()
+	
 	if _, exists := nm.rateHistory[interfaceName]; !exists {
 		nm.rateHistory[interfaceName] = make([]RateSample, 0, HistorySize)
 	}
@@ -487,13 +572,15 @@ func (nm *NetworkMonitor) updateRateHistory(interfaceName string, rxRate, txRate
 		Time:   time.Now(),
 	})
 	
-	// Keep only last 60 data points
 	if len(nm.rateHistory[interfaceName]) > HistorySize {
 		nm.rateHistory[interfaceName] = nm.rateHistory[interfaceName][1:]
 	}
 }
 
 func (nm *NetworkMonitor) getAvgRates(interfaceName string) (float64, float64) {
+	nm.mu.RLock()
+	defer nm.mu.RUnlock()
+	
 	samples, exists := nm.rateHistory[interfaceName]
 	if !exists || len(samples) == 0 {
 		return 0.0, 0.0
@@ -508,12 +595,96 @@ func (nm *NetworkMonitor) getAvgRates(interfaceName string) (float64, float64) {
 	return totalRx / float64(len(samples)), totalTx / float64(len(samples))
 }
 
+func (nm *NetworkMonitor) cleanupOldCache() {
+	nm.mu.Lock()
+	defer nm.mu.Unlock()
+	
+	now := time.Now()
+	maxCacheAge := time.Duration(nm.config.CacheTTL*2) * time.Second
+	
+	for iface, samples := range nm.rateHistory {
+		if len(samples) > 0 {
+			age := now.Sub(samples[0].Time)
+			if age > maxCacheAge {
+				delete(nm.rateHistory, iface)
+			}
+		}
+	}
+	
+	if len(nm.stateCache) > 1000 {
+		nm.stateCache = make(map[string]string)
+	}
+	if len(nm.speedCache) > 1000 {
+		nm.speedCache = make(map[string]*int)
+	}
+	if len(nm.duplexCache) > 1000 {
+		nm.duplexCache = make(map[string]*string)
+	}
+	if len(nm.mtuCache) > 1000 {
+		nm.mtuCache = make(map[string]*int)
+	}
+}
+
+func (nm *NetworkMonitor) readProcNetDev() ([]byte, error) {
+	file, err := os.Open(ProcNetDev)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	
+	return io.ReadAll(io.LimitReader(file, 65536))
+}
+
+func (nm *NetworkMonitor) parseNetDevLine(line string, validIfaces []string) (string, InterfaceTraffic, error) {
+	parts := strings.Fields(line)
+	if len(parts) < 17 {
+		return "", InterfaceTraffic{}, fmt.Errorf("insufficient fields")
+	}
+	
+	iface := strings.TrimSuffix(parts[0], ":")
+	if !nm.safeInterfaceName(iface) {
+		return "", InterfaceTraffic{}, fmt.Errorf("invalid interface name")
+	}
+	
+	if len(validIfaces) > 0 {
+		found := false
+		for _, validIface := range validIfaces {
+			if iface == validIface {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return "", InterfaceTraffic{}, fmt.Errorf("interface not in filter")
+		}
+	}
+	
+	var traffic InterfaceTraffic
+	var parseErr error
+	
+	traffic.Name = iface
+	traffic.RxBytes, parseErr = strconv.ParseInt(parts[1], 10, 64)
+	if parseErr != nil {
+		return "", InterfaceTraffic{}, fmt.Errorf("invalid rx_bytes: %v", parseErr)
+	}
+	
+	traffic.RxPackets, _ = strconv.ParseInt(parts[2], 10, 64)
+	traffic.RxErrs, _ = strconv.ParseInt(parts[3], 10, 64)
+	traffic.RxDrop, _ = strconv.ParseInt(parts[4], 10, 64)
+	traffic.TxBytes, _ = strconv.ParseInt(parts[9], 10, 64)
+	traffic.TxPackets, _ = strconv.ParseInt(parts[10], 10, 64)
+	traffic.TxErrs, _ = strconv.ParseInt(parts[11], 10, 64)
+	traffic.TxDrop, _ = strconv.ParseInt(parts[12], 10, 64)
+	
+	return iface, traffic, nil
+}
+
 func parseProcNetDev(monitor *NetworkMonitor, filterIfaces []string) map[string]InterfaceTraffic {
 	stats := make(map[string]InterfaceTraffic)
 	
-	data, err := ioutil.ReadFile(ProcNetDev)
+	data, err := monitor.readProcNetDev()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%sError: %s does not exist%s\n", Colors.Red, ProcNetDev, Colors.Reset)
+		fmt.Fprintf(os.Stderr, "%sError reading %s: %v%s\n", Colors.Red, ProcNetDev, err, Colors.Reset)
 		return stats
 	}
 	
@@ -525,37 +696,12 @@ func parseProcNetDev(monitor *NetworkMonitor, filterIfaces []string) map[string]
 			continue
 		}
 		
-		parts := strings.Fields(line)
-		if len(parts) < 17 {
+		iface, traffic, err := monitor.parseNetDevLine(line, validIfaces)
+		if err != nil {
 			continue
 		}
 		
-		iface := strings.TrimSuffix(parts[0], ":")
-		
-		if len(validIfaces) > 0 {
-			found := false
-			for _, validIface := range validIfaces {
-				if iface == validIface {
-					found = true
-					break
-				}
-			}
-			if !found {
-				continue
-			}
-		}
-		
-		// Parse statistics
-		rxBytes, _ := strconv.ParseInt(parts[1], 10, 64)
-		rxPackets, _ := strconv.ParseInt(parts[2], 10, 64)
-		rxErrs, _ := strconv.ParseInt(parts[3], 10, 64)
-		rxDrop, _ := strconv.ParseInt(parts[4], 10, 64)
-		txBytes, _ := strconv.ParseInt(parts[9], 10, 64)
-		txPackets, _ := strconv.ParseInt(parts[10], 10, 64)
-		txErrs, _ := strconv.ParseInt(parts[11], 10, 64)
-		txDrop, _ := strconv.ParseInt(parts[12], 10, 64)
-		
-		if !monitor.config.ShowInactive && rxBytes == 0 && txBytes == 0 {
+		if !monitor.config.ShowInactive && traffic.RxBytes == 0 && traffic.TxBytes == 0 {
 			continue
 		}
 		
@@ -570,23 +716,12 @@ func parseProcNetDev(monitor *NetworkMonitor, filterIfaces []string) map[string]
 			ipv4Addr = &addrs["ipv4"][0]
 		}
 		
-		traffic := InterfaceTraffic{
-			Name:      iface,
-			RxBytes:   rxBytes,
-			TxBytes:   txBytes,
-			RxPackets: rxPackets,
-			TxPackets: txPackets,
-			RxErrs:    rxErrs,
-			TxErrs:    txErrs,
-			RxDrop:    rxDrop,
-			TxDrop:    txDrop,
-			Mtu:       mtu,
-			State:     state,
-			IPv4Addr:  ipv4Addr,
-			IPv6Addrs: addrs["ipv6"],
-			Speed:     speed,
-			Duplex:    duplex,
-		}
+		traffic.State = state
+		traffic.Mtu = mtu
+		traffic.IPv4Addr = ipv4Addr
+		traffic.IPv6Addrs = addrs["ipv6"]
+		traffic.Speed = speed
+		traffic.Duplex = duplex
 		
 		stats[iface] = traffic
 		
@@ -645,13 +780,11 @@ func displayTrafficStats(monitor *NetworkMonitor, filterIfaces []string) {
 	
 	fmt.Printf("%s\nTraffic Statistics:%s\n", Colors.Blue, Colors.Reset)
 	
-	// Convert to slice for sorting
 	statsSlice := make([]InterfaceTraffic, 0, len(stats))
 	for _, traffic := range stats {
 		statsSlice = append(statsSlice, traffic)
 	}
 	
-	// Sort by total traffic
 	sort.Slice(statsSlice, func(i, j int) bool {
 		return statsSlice[i].TotalBytes() > statsSlice[j].TotalBytes()
 	})
@@ -691,129 +824,148 @@ func clearScreen() {
 	fmt.Print("\033[H\033[J")
 }
 
+func setupSignalHandler() context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	
+	go func() {
+		<-sigCh
+		cancel()
+		<-sigCh
+		os.Exit(1)
+	}()
+	
+	return ctx
+}
+
+func (nm *NetworkMonitor) buildInterfaceLine(iface string, traffic InterfaceTraffic, prevTraffic InterfaceTraffic) string {
+	var sb strings.Builder
+	
+	stateColor := Colors.Green
+	if !traffic.IsUp() {
+		stateColor = Colors.Red
+	}
+	
+	speedInfo := ""
+	if traffic.Speed != nil {
+		speedInfo = fmt.Sprintf(" (%d Mbps)", *traffic.Speed)
+	}
+	
+	sb.WriteString(fmt.Sprintf("%s%-12s%s [%s%s%s]%s", 
+		Colors.Sepia, iface, Colors.Reset, 
+		stateColor, traffic.State, Colors.Reset, speedInfo))
+	
+	if prevTraffic.Name != "" {
+		rxRate := nm.calculateRate(traffic.RxBytes, prevTraffic.RxBytes, nm.config.Interval)
+		txRate := nm.calculateRate(traffic.TxBytes, prevTraffic.TxBytes, nm.config.Interval)
+		avgRx, avgTx := nm.getAvgRates(iface)
+		
+		sb.WriteString(fmt.Sprintf(" RX %s%-12s%s", Colors.Green, nm.formatRatePrecise(rxRate), Colors.Reset))
+		sb.WriteString(fmt.Sprintf(" TX %s%-12s%s", Colors.Yellow, nm.formatRatePrecise(txRate), Colors.Reset))
+		sb.WriteString(fmt.Sprintf(" Avg: %sRX%s TX%s%s", Colors.Cyan, 
+			nm.formatRatePrecise(avgRx), 
+			nm.formatRatePrecise(avgTx), Colors.Reset))
+	} else {
+		sb.WriteString(fmt.Sprintf(" RX %s%-12s%s", Colors.Green, nm.formatBytes(traffic.RxBytes), Colors.Reset))
+		sb.WriteString(fmt.Sprintf(" TX %s%-12s%s", Colors.Yellow, nm.formatBytes(traffic.TxBytes), Colors.Reset))
+		sb.WriteString(fmt.Sprintf(" %s(initial)%s", Colors.Grey, Colors.Reset))
+	}
+	
+	return sb.String()
+}
+
+func (nm *NetworkMonitor) updateDisplay(filterIfaces []string, updateCount int, startTime time.Time) {
+	clearScreen()
+	currentTime := time.Now()
+	elapsedTotal := currentTime.Sub(startTime).Seconds()
+	
+	fmt.Printf("%sLive Network Traffic Monitor%s\n", Colors.Blue, Colors.Reset)
+	fmt.Printf("%sInterval: %.1fs | Uptime: %.0fs | Updates: %d%s\n\n", 
+		Colors.Grey, nm.config.Interval, elapsedTotal, updateCount, Colors.Reset)
+	
+	currStats := parseProcNetDev(nm, filterIfaces)
+	
+	for iface, now := range currStats {
+		if prev, exists := nm.prevTraffic[iface]; exists {
+			rxRate := nm.calculateRate(now.RxBytes, prev.RxBytes, nm.config.Interval)
+			txRate := nm.calculateRate(now.TxBytes, prev.TxBytes, nm.config.Interval)
+			nm.updateRateHistory(iface, rxRate, txRate)
+		}
+	}
+	
+	statsSlice := make([]struct {
+		Name    string
+		Traffic InterfaceTraffic
+	}, 0, len(currStats))
+	
+	for iface, traffic := range currStats {
+		statsSlice = append(statsSlice, struct {
+			Name    string
+			Traffic InterfaceTraffic
+		}{iface, traffic})
+	}
+	
+	sort.Slice(statsSlice, func(i, j int) bool {
+		avgRxI, _ := nm.getAvgRates(statsSlice[i].Name)
+		avgRxJ, _ := nm.getAvgRates(statsSlice[j].Name)
+		return avgRxI > avgRxJ
+	})
+	
+	for _, item := range statsSlice {
+		line := nm.buildInterfaceLine(item.Name, item.Traffic, nm.prevTraffic[item.Name])
+		fmt.Println(line)
+	}
+	
+	if len(currStats) == 0 {
+		fmt.Printf("%sNo active interfaces to monitor.%s\n", Colors.Grey, Colors.Reset)
+	}
+	
+	activeCount := 0
+	var totalRx, totalTx int64
+	for _, traffic := range currStats {
+		if traffic.IsActive() {
+			activeCount++
+		}
+		totalRx += traffic.RxBytes
+		totalTx += traffic.TxBytes
+	}
+	
+	fmt.Printf("\n%s[Ctrl+C to stop] | Interfaces: %d (active: %d) | Total: RX%s TX%s | %s%s\n",
+		Colors.Grey, len(currStats), activeCount, 
+		nm.formatBytes(totalRx), nm.formatBytes(totalTx),
+		time.Now().Format("15:04:05"), Colors.Reset)
+	
+	nm.prevTraffic = currStats
+}
+
 func watchModeImproved(monitor *NetworkMonitor, filterIfaces []string, interval float64) {
-	prevStats := make(map[string]InterfaceTraffic)
+	ctx := setupSignalHandler()
+	monitor.config.Interval = interval
+	
+	ticker := time.NewTicker(time.Duration(interval * float64(time.Second)))
+	defer ticker.Stop()
+	
+	cleanupTicker := time.NewTicker(30 * time.Second)
+	defer cleanupTicker.Stop()
+	
 	startTime := time.Now()
 	updateCount := 0
-	
-	// Signal handling
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	
 	fmt.Printf("Watching TCP connections (refresh every %.1fs). Press Ctrl+C to stop.\n", interval)
 	fmt.Printf("Started at: %s\n\n", startTime.Format("2006-01-02 15:04:05"))
 	
 	for {
 		select {
-		case <-sigCh:
+		case <-ctx.Done():
 			fmt.Printf("\n%sMonitoring stopped after %d updates.%s\n", Colors.Red, updateCount, Colors.Reset)
 			return
-		default:
-			clearScreen()
-			currentTime := time.Now()
-			elapsedTotal := currentTime.Sub(startTime).Seconds()
-			
-			fmt.Printf("%sLive Network Traffic Monitor%s\n", Colors.Blue, Colors.Reset)
-			fmt.Printf("%sInterval: %.1fs | Uptime: %.0fs | Updates: %d%s\n\n", 
-				Colors.Grey, interval, elapsedTotal, updateCount, Colors.Reset)
-			
-			currStats := parseProcNetDev(monitor, filterIfaces)
-			
-			// Calculate rates and update history
-			for iface, now := range currStats {
-				if prev, exists := prevStats[iface]; exists {
-					rxRate := monitor.calculateRate(now.RxBytes, prev.RxBytes, interval)
-					txRate := monitor.calculateRate(now.TxBytes, prev.TxBytes, interval)
-					monitor.updateRateHistory(iface, rxRate, txRate)
-				}
-			}
-			
-			// Convert to slice for sorting by RX rate
-			statsSlice := make([]struct {
-				Name    string
-				Traffic InterfaceTraffic
-			}, 0, len(currStats))
-			
-			for iface, traffic := range currStats {
-				statsSlice = append(statsSlice, struct {
-					Name    string
-					Traffic InterfaceTraffic
-				}{iface, traffic})
-			}
-			
-			// Sort by average RX rate
-			sort.Slice(statsSlice, func(i, j int) bool {
-				avgRxI, _ := monitor.getAvgRates(statsSlice[i].Name)
-				avgRxJ, _ := monitor.getAvgRates(statsSlice[j].Name)
-				return avgRxI > avgRxJ
-			})
-			
-			for _, item := range statsSlice {
-				iface := item.Name
-				now := item.Traffic
-				
-				stateColor := Colors.Green
-				if !now.IsUp() {
-					stateColor = Colors.Red
-				}
-				
-				speedInfo := ""
-				if now.Speed != nil {
-					speedInfo = fmt.Sprintf(" (%d Mbps)", *now.Speed)
-				}
-				
-				lineParts := []string{
-					fmt.Sprintf("%s%-12s%s [%s%s%s]%s", 
-						Colors.Sepia, iface, Colors.Reset, 
-						stateColor, now.State, Colors.Reset, speedInfo),
-				}
-				
-				if prev, exists := prevStats[iface]; exists {
-					rxRate := monitor.calculateRate(now.RxBytes, prev.RxBytes, interval)
-					txRate := monitor.calculateRate(now.TxBytes, prev.TxBytes, interval)
-					avgRx, avgTx := monitor.getAvgRates(iface)
-					
-					lineParts = append(lineParts,
-						fmt.Sprintf("RX %s%-12s%s", Colors.Green, monitor.formatRatePrecise(rxRate), Colors.Reset),
-						fmt.Sprintf("TX %s%-12s%s", Colors.Yellow, monitor.formatRatePrecise(txRate), Colors.Reset),
-						fmt.Sprintf("Avg: %sRX%s TX%s%s", Colors.Cyan, 
-							monitor.formatRatePrecise(avgRx), 
-							monitor.formatRatePrecise(avgTx), Colors.Reset),
-					)
-				} else {
-					lineParts = append(lineParts,
-						fmt.Sprintf("RX %s%-12s%s", Colors.Green, monitor.formatBytes(now.RxBytes), Colors.Reset),
-						fmt.Sprintf("TX %s%-12s%s", Colors.Yellow, monitor.formatBytes(now.TxBytes), Colors.Reset),
-						fmt.Sprintf("%s(initial)%s", Colors.Grey, Colors.Reset),
-					)
-				}
-				
-				fmt.Println(strings.Join(lineParts, " "))
-			}
-			
-			if len(currStats) == 0 {
-				fmt.Printf("%sNo active interfaces to monitor.%s\n", Colors.Grey, Colors.Reset)
-			}
-			
-			activeCount := 0
-			var totalRx, totalTx int64
-			for _, traffic := range currStats {
-				if traffic.IsActive() {
-					activeCount++
-				}
-				totalRx += traffic.RxBytes
-				totalTx += traffic.TxBytes
-			}
-			
-			fmt.Printf("\n%s[Ctrl+C to stop] | Interfaces: %d (active: %d) | Total: RX%s TX%s | %s%s\n",
-				Colors.Grey, len(currStats), activeCount, 
-				monitor.formatBytes(totalRx), monitor.formatBytes(totalTx),
-				time.Now().Format("15:04:05"), Colors.Reset)
-			
-			prevStats = currStats
+		case <-cleanupTicker.C:
+			monitor.cleanupOldCache()
+		case <-ticker.C:
+			monitor.updateDisplay(filterIfaces, updateCount, startTime)
 			updateCount++
-			
-			time.Sleep(time.Duration(interval * float64(time.Second)))
 		}
 	}
 }
@@ -870,7 +1022,6 @@ func main() {
 	
 	flag.Parse()
 	
-	// Platform check
 	if _, err := os.Stat("/proc/net/dev"); os.IsNotExist(err) {
 		fmt.Fprintf(os.Stderr, "%sError: This tool only works on Linux systems%s\n", Colors.Red, Colors.Reset)
 		os.Exit(1)
@@ -890,6 +1041,11 @@ func main() {
 		CounterBits:   64,
 		Units:         *units,
 		ShowProcesses: false,
+	}
+	
+	if err := validateConfig(&config); err != nil {
+		fmt.Fprintf(os.Stderr, "%sError: %v%s\n", Colors.Red, err, Colors.Reset)
+		os.Exit(1)
 	}
 	
 	monitor := NewNetworkMonitor(config)
