@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"net"
 	"os"
@@ -27,6 +28,12 @@ const (
 	MaxInterval   = 3600
 	DefaultUnits  = "binary"
 	HistorySize   = 60
+	CleanupAge    = time.Hour
+)
+
+var (
+	InfoLog  = log.New(os.Stdout, "INFO: ", log.Ldate|log.Ltime)
+	ErrorLog = log.New(os.Stderr, "ERROR: ", log.Ldate|log.Ltime)
 )
 
 type MonitorConfig struct {
@@ -94,6 +101,7 @@ type NetworkMonitor struct {
 	cacheTime      time.Time
 	prevTraffic    map[string]InterfaceTraffic
 	rateHistory    map[string][]RateSample
+	lastCleanup    time.Time
 }
 
 var Colors = struct {
@@ -140,6 +148,7 @@ func NewNetworkMonitor(config MonitorConfig) *NetworkMonitor {
 		duplexCache: make(map[string]*string),
 		prevTraffic: make(map[string]InterfaceTraffic),
 		rateHistory: make(map[string][]RateSample),
+		lastCleanup: time.Now(),
 	}
 }
 
@@ -154,7 +163,10 @@ func validateConfig(config *MonitorConfig) error {
 		return fmt.Errorf("units must be 'binary' or 'decimal'")
 	}
 	if config.CacheTTL <= 0 {
-		return fmt.Errorf("cache TTL must be positive")
+		config.CacheTTL = 5.0
+	}
+	if config.CounterBits <= 0 {
+		config.CounterBits = 64
 	}
 	return nil
 }
@@ -387,7 +399,7 @@ func (nm *NetworkMonitor) validateInterfaces(requestedIfaces []string) []string 
 	}
 	
 	if len(invalidIfaces) > 0 {
-		fmt.Fprintf(os.Stderr, "%sWarning: Invalid interfaces: %v%s\n", Colors.Red, invalidIfaces, Colors.Reset)
+		ErrorLog.Printf("Invalid interfaces: %v", invalidIfaces)
 	}
 	
 	return validIfaces
@@ -546,16 +558,18 @@ func (nm *NetworkMonitor) calculateRate(current, previous int64, interval float6
 		return 0.0
 	}
 	
+	var diff int64
 	if current >= previous {
-		return float64(current-previous) / interval
+		diff = current - previous
+	} else {
+		maxValue := int64(1<<uint(nm.config.CounterBits) - 1)
+		if maxValue < 0 {
+			maxValue = math.MaxInt64
+		}
+		diff = (maxValue - previous) + current + 1
 	}
 	
-	maxCount := float64(uint64(1)<<uint(nm.config.CounterBits) - 1)
-	if maxCount < 0 {
-		maxCount = math.MaxInt64
-	}
-	
-	return (maxCount - float64(previous) + float64(current) + 1) / interval
+	return float64(diff) / interval
 }
 
 func (nm *NetworkMonitor) updateRateHistory(interfaceName string, rxRate, txRate float64) {
@@ -595,19 +609,21 @@ func (nm *NetworkMonitor) getAvgRates(interfaceName string) (float64, float64) {
 	return totalRx / float64(len(samples)), totalTx / float64(len(samples))
 }
 
-func (nm *NetworkMonitor) cleanupOldCache() {
+func (nm *NetworkMonitor) cleanupStaleData() {
 	nm.mu.Lock()
 	defer nm.mu.Unlock()
 	
 	now := time.Now()
-	maxCacheAge := time.Duration(nm.config.CacheTTL*2) * time.Second
+	cutoff := now.Add(-CleanupAge)
 	
 	for iface, samples := range nm.rateHistory {
-		if len(samples) > 0 {
-			age := now.Sub(samples[0].Time)
-			if age > maxCacheAge {
-				delete(nm.rateHistory, iface)
-			}
+		if len(samples) > 0 && samples[len(samples)-1].Time.Before(cutoff) {
+			delete(nm.rateHistory, iface)
+			delete(nm.prevTraffic, iface)
+			delete(nm.stateCache, iface)
+			delete(nm.speedCache, iface)
+			delete(nm.duplexCache, iface)
+			delete(nm.mtuCache, iface)
 		}
 	}
 	
@@ -623,6 +639,8 @@ func (nm *NetworkMonitor) cleanupOldCache() {
 	if len(nm.mtuCache) > 1000 {
 		nm.mtuCache = make(map[string]*int)
 	}
+	
+	nm.lastCleanup = now
 }
 
 func (nm *NetworkMonitor) readProcNetDev() ([]byte, error) {
@@ -660,21 +678,48 @@ func (nm *NetworkMonitor) parseNetDevLine(line string, validIfaces []string) (st
 	}
 	
 	var traffic InterfaceTraffic
-	var parseErr error
-	
 	traffic.Name = iface
+	
+	var parseErr error
 	traffic.RxBytes, parseErr = strconv.ParseInt(parts[1], 10, 64)
 	if parseErr != nil {
 		return "", InterfaceTraffic{}, fmt.Errorf("invalid rx_bytes: %v", parseErr)
 	}
 	
-	traffic.RxPackets, _ = strconv.ParseInt(parts[2], 10, 64)
-	traffic.RxErrs, _ = strconv.ParseInt(parts[3], 10, 64)
-	traffic.RxDrop, _ = strconv.ParseInt(parts[4], 10, 64)
-	traffic.TxBytes, _ = strconv.ParseInt(parts[9], 10, 64)
-	traffic.TxPackets, _ = strconv.ParseInt(parts[10], 10, 64)
-	traffic.TxErrs, _ = strconv.ParseInt(parts[11], 10, 64)
-	traffic.TxDrop, _ = strconv.ParseInt(parts[12], 10, 64)
+	traffic.RxPackets, parseErr = strconv.ParseInt(parts[2], 10, 64)
+	if parseErr != nil {
+		return "", InterfaceTraffic{}, fmt.Errorf("invalid rx_packets: %v", parseErr)
+	}
+	
+	traffic.RxErrs, parseErr = strconv.ParseInt(parts[3], 10, 64)
+	if parseErr != nil {
+		return "", InterfaceTraffic{}, fmt.Errorf("invalid rx_errs: %v", parseErr)
+	}
+	
+	traffic.RxDrop, parseErr = strconv.ParseInt(parts[4], 10, 64)
+	if parseErr != nil {
+		return "", InterfaceTraffic{}, fmt.Errorf("invalid rx_drop: %v", parseErr)
+	}
+	
+	traffic.TxBytes, parseErr = strconv.ParseInt(parts[9], 10, 64)
+	if parseErr != nil {
+		return "", InterfaceTraffic{}, fmt.Errorf("invalid tx_bytes: %v", parseErr)
+	}
+	
+	traffic.TxPackets, parseErr = strconv.ParseInt(parts[10], 10, 64)
+	if parseErr != nil {
+		return "", InterfaceTraffic{}, fmt.Errorf("invalid tx_packets: %v", parseErr)
+	}
+	
+	traffic.TxErrs, parseErr = strconv.ParseInt(parts[11], 10, 64)
+	if parseErr != nil {
+		return "", InterfaceTraffic{}, fmt.Errorf("invalid tx_errs: %v", parseErr)
+	}
+	
+	traffic.TxDrop, parseErr = strconv.ParseInt(parts[12], 10, 64)
+	if parseErr != nil {
+		return "", InterfaceTraffic{}, fmt.Errorf("invalid tx_drop: %v", parseErr)
+	}
 	
 	return iface, traffic, nil
 }
@@ -684,7 +729,7 @@ func parseProcNetDev(monitor *NetworkMonitor, filterIfaces []string) map[string]
 	
 	data, err := monitor.readProcNetDev()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%sError reading %s: %v%s\n", Colors.Red, ProcNetDev, err, Colors.Reset)
+		ErrorLog.Printf("Error reading %s: %v", ProcNetDev, err)
 		return stats
 	}
 	
@@ -824,7 +869,7 @@ func clearScreen() {
 	fmt.Print("\033[H\033[J")
 }
 
-func setupSignalHandler() context.Context {
+func setupSignalHandler() (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
 	
 	sigCh := make(chan os.Signal, 1)
@@ -837,7 +882,7 @@ func setupSignalHandler() context.Context {
 		os.Exit(1)
 	}()
 	
-	return ctx
+	return ctx, cancel
 }
 
 func (nm *NetworkMonitor) buildInterfaceLine(iface string, traffic InterfaceTraffic, prevTraffic InterfaceTraffic) string {
@@ -941,7 +986,9 @@ func (nm *NetworkMonitor) updateDisplay(filterIfaces []string, updateCount int, 
 }
 
 func watchModeImproved(monitor *NetworkMonitor, filterIfaces []string, interval float64) {
-	ctx := setupSignalHandler()
+	ctx, cancel := setupSignalHandler()
+	defer cancel()
+	
 	monitor.config.Interval = interval
 	
 	ticker := time.NewTicker(time.Duration(interval * float64(time.Second)))
@@ -953,16 +1000,17 @@ func watchModeImproved(monitor *NetworkMonitor, filterIfaces []string, interval 
 	startTime := time.Now()
 	updateCount := 0
 	
-	fmt.Printf("Watching TCP connections (refresh every %.1fs). Press Ctrl+C to stop.\n", interval)
-	fmt.Printf("Started at: %s\n\n", startTime.Format("2006-01-02 15:04:05"))
+	InfoLog.Printf("Watching TCP connections (refresh every %.1fs)", interval)
+	InfoLog.Printf("Started at: %s", startTime.Format("2006-01-02 15:04:05"))
 	
 	for {
 		select {
 		case <-ctx.Done():
-			fmt.Printf("\n%sMonitoring stopped after %d updates.%s\n", Colors.Red, updateCount, Colors.Reset)
+			monitor.cleanupStaleData()
+			InfoLog.Printf("Monitoring stopped after %d updates", updateCount)
 			return
 		case <-cleanupTicker.C:
-			monitor.cleanupOldCache()
+			monitor.cleanupStaleData()
 		case <-ticker.C:
 			monitor.updateDisplay(filterIfaces, updateCount, startTime)
 			updateCount++
@@ -999,7 +1047,7 @@ func outputJSON(monitor *NetworkMonitor, filterIfaces []string) {
 	
 	jsonData, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%sError generating JSON: %v%s\n", Colors.Red, err, Colors.Reset)
+		ErrorLog.Printf("Error generating JSON: %v", err)
 		return
 	}
 	
@@ -1023,7 +1071,7 @@ func main() {
 	flag.Parse()
 	
 	if _, err := os.Stat("/proc/net/dev"); os.IsNotExist(err) {
-		fmt.Fprintf(os.Stderr, "%sError: This tool only works on Linux systems%s\n", Colors.Red, Colors.Reset)
+		ErrorLog.Println("This tool only works on Linux systems")
 		os.Exit(1)
 	}
 	
@@ -1044,7 +1092,7 @@ func main() {
 	}
 	
 	if err := validateConfig(&config); err != nil {
-		fmt.Fprintf(os.Stderr, "%sError: %v%s\n", Colors.Red, err, Colors.Reset)
+		ErrorLog.Printf("Configuration error: %v", err)
 		os.Exit(1)
 	}
 	
